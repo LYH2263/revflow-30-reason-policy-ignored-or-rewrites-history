@@ -47,7 +47,8 @@ function yuan(cents) {
     <h1>归并台</h1>
     <p class="lead">对「待归并」正向与冲正跑一轮净额归并：配平落余额，未平项按原因码落隔离。</p>
     <p class="note-strip">
-      本轮处理「待归并」流水，并复扫「未平」隔离项进入配平；策略标签仅作展示。
+      本轮处理「待归并」流水，并复扫「未平」隔离项。再配严格按原因码**当前策略**执行：
+      自动可再配放行，需确认项未登记确认一律拦下，永久拒绝永不改余额；每轮决策追加策略证明。
     </p>
     <div class="row-actions">
       <button class="btn" :disabled="busy" @click="runSettle">跑净额归并</button>

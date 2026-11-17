@@ -61,7 +61,7 @@ const maxCount = computed(() => {
       <div class="panel">
         <table>
           <thead>
-            <tr><th>原因码</th><th>名称</th><th>策略</th><th>未平</th><th>未平金额（元）</th></tr>
+            <tr><th>原因码</th><th>名称</th><th>策略</th><th>版本</th><th>未平</th><th>未平金额（元）</th></tr>
           </thead>
           <tbody>
             <tr v-for="b in data.原因分桶" :key="b.reason_code">
@@ -73,6 +73,7 @@ const maxCount = computed(() => {
                   :class="b.policy === '自动可再配' ? 'on' : (b.policy === '永久拒绝' ? 'bad' : 'warn')"
                 >{{ b.policy }}</span>
               </td>
+              <td class="mono">v{{ b.policy_version }}</td>
               <td>{{ b.open_count }}</td>
               <td>{{ yuan(b.open_amount_cents) }}</td>
             </tr>

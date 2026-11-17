@@ -84,7 +84,7 @@ function yuan(cents) {
       <table>
         <thead>
           <tr>
-            <th>原因码</th><th>名称</th><th>策略</th><th>未平</th>
+            <th>原因码</th><th>名称</th><th>策略</th><th>版本</th><th>未平</th>
             <th>未平金额（元）</th><th>本轮新增</th><th>本轮再配</th>
           </tr>
         </thead>
@@ -98,6 +98,7 @@ function yuan(cents) {
                 :class="b.policy === '自动可再配' ? 'on' : (b.policy === '永久拒绝' ? 'bad' : 'warn')"
               >{{ b.policy }}</span>
             </td>
+            <td class="mono">v{{ b.policy_version }}</td>
             <td>{{ b.open_count }}</td>
             <td>{{ yuan(b.open_amount_cents) }}</td>
             <td>{{ b.new_count }}</td>

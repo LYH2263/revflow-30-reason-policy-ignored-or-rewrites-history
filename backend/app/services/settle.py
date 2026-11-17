@@ -14,14 +14,26 @@ def _now() -> str:
 
 
 # —— 策略门禁 ——
+#
+# 决策路径：隔离行在「入隔离」时钉死策略版本（policy_at_quarantine +
+# policy_version），此后策略变更**不改写该行**；每轮复扫是一次新决策，按当前
+# （各码最大版本）策略执行，并追加一条策略证明。旧决策行与已再配行永不被回溯。
+
+
+def _policy_row(policy_map: dict[str, dict], code: str) -> dict:
+    """当前策略行；查不到时 fail-closed 视为「需确认」，绝不放行。"""
+    row = policy_map.get(code)
+    if not row or not qp.is_valid_policy(row["policy"]):
+        return {
+            "reason_code": code,
+            "policy": qp.POLICY_CONFIRM,
+            "version": 0,
+        }
+    return row
 
 
 def _current_policy(policy_map: dict[str, dict], code: str) -> str:
-    """当前策略以策略表为准；查不到时 fail-closed 按「需确认」处理。"""
-    row = policy_map.get(code)
-    if not row or not qp.is_valid_policy(row["policy"]):
-        return qp.POLICY_CONFIRM
-    return row["policy"]
+    return _policy_row(policy_map, code)["policy"]
 
 
 def _has_confirmation(conn, quarantine_id: int) -> bool:
@@ -32,14 +44,22 @@ def _has_confirmation(conn, quarantine_id: int) -> bool:
     return row is not None
 
 
-def _gate(conn, policy_map: dict[str, dict], item: dict) -> tuple[str, str]:
-    """返回 (策略, 是否允许本轮尝试配平)。永久拒绝永不触达余额。"""
-    policy = _current_policy(policy_map, item["reason_code"])
+def _gate(conn, policy_map: dict[str, dict], item: dict) -> tuple[dict, bool]:
+    """返回 (当前策略行, 是否允许本轮尝试配平)。
+
+    - 自动可再配：放行。
+    - 需确认后可再配：登记确认后才放行；无确认一律拦住。
+    - 永久拒绝：永不放行，永不触达余额。
+    - 未知 / 非法策略：fail-closed，按需确认处理。
+    """
+    row = _policy_row(policy_map, item["reason_code"])
+    policy = row["policy"]
+    if policy == qp.POLICY_AUTO:
+        return row, True
     if policy == qp.POLICY_PERMANENT:
-        return policy, True
-    if policy == qp.POLICY_CONFIRM:
-        return policy, True
-    return policy, True
+        return row, False
+    # 需确认（含 fail-closed 兜底）必须有人工确认登记。
+    return row, _has_confirmation(conn, item["id"])
 
 
 # —— 原因分桶（隔离 / 策略同源） ——
@@ -77,11 +97,13 @@ def reason_buckets(conn, settle_run_id: int | None = None) -> list[dict]:
     out = []
     for code, meta in sorted(qp.REASON_BY_CODE.items(), key=lambda kv: kv[1]["sort_order"]):
         r = by_code.pop(code, {})
+        row = _policy_row(policies, code)
         out.append(
             {
                 "reason_code": code,
                 "label": meta["label"],
-                "policy": _current_policy(policies, code),
+                "policy": row["policy"],
+                "policy_version": row["version"],
                 "total": r.get("total", 0) or 0,
                 "open_count": r.get("open_count", 0) or 0,
                 "open_amount_cents": r.get("open_amount_cents", 0) or 0,
@@ -94,9 +116,11 @@ def reason_buckets(conn, settle_run_id: int | None = None) -> list[dict]:
     # 未知原因码（理论上不应出现）也如实分桶，避免静默吞数。
     for code, r in by_code.items():
         r = dict(r)
+        row = _policy_row(policies, code)
         r["reason_code"] = code
         r["label"] = code
-        r["policy"] = _current_policy(policies, code)
+        r["policy"] = row["policy"]
+        r["policy_version"] = row["version"]
         out.append(r)
     return out
 
@@ -169,7 +193,12 @@ def list_entries(kind: str | None = None) -> list[dict]:
 
 
 def list_quarantine() -> list[dict]:
-    """每条隔离带原因码、当前策略与确认标记；策略以策略表当前值为准。"""
+    """每条隔离带原因码、当前策略、钉死快照与确认标记。
+
+    展示的 `policy` / `policy_version` 是策略表**当前**值，用于「下一轮会怎么判」；
+    `policy_at_quarantine` / `snapshot_version` 是入隔离时钉死的快照，二者分列，
+    便于核对「改策略不改史」。
+    """
     with connect() as conn:
         policies = qp.policy_map(conn)
         rows = rows_to_dicts(
@@ -183,8 +212,12 @@ def list_quarantine() -> list[dict]:
             ).fetchall()
         )
         for r in rows:
+            row = _policy_row(policies, r["reason_code"])
             r["reason_label"] = qp.label(r["reason_code"])
-            r["policy"] = _current_policy(policies, r["reason_code"])
+            # 先留入隔离时钉死的快照，再给出「当前」策略（用于下一轮会怎么判）。
+            r["snapshot_version"] = r["policy_version"]
+            r["policy"] = row["policy"]
+            r["policy_version"] = row["version"]
             conf = conn.execute(
                 """
                 SELECT * FROM quarantine_confirmations
@@ -193,7 +226,11 @@ def list_quarantine() -> list[dict]:
                 (r["id"],),
             ).fetchone()
             r["confirmation"] = dict(conf) if conf else None
-            r["can_confirm"] = r["policy"] == qp.POLICY_CONFIRM and r["status"] == "未平" and conf is None
+            r["can_confirm"] = (
+                r["policy"] == qp.POLICY_CONFIRM
+                and r["status"] == "未平"
+                and conf is None
+            )
         return rows
 
 
@@ -215,7 +252,7 @@ def list_verify_reports() -> list[dict]:
         return rows
 
 
-# —— 策略与确认 ——
+# —— 策略、版本与证明（只读） ——
 
 
 def list_policies() -> dict:
@@ -229,7 +266,38 @@ def list_policies() -> dict:
         return {"策略": rows, "可选策略": list(qp.ALL_POLICIES)}
 
 
+def list_policy_versions(code: str | None = None) -> dict:
+    """只读版本台账：策略表按原因码 + 版本的全部历史。"""
+    with connect() as conn:
+        if code and code not in qp.REASON_BY_CODE:
+            raise HTTPException(404, f"原因码不存在：{code}")
+        return {"版本": qp.list_policy_versions(conn, code)}
+
+
+def list_policy_proofs(
+    quarantine_id: int | None = None,
+    policy_version: int | None = None,
+    reason_code: str | None = None,
+    quarantine_key: str | None = None,
+    action: str | None = None,
+    limit: int = 200,
+) -> dict:
+    """只读策略证明：可按隔离 id / 策略版本（及原因码/隔离键/动作）查询。"""
+    with connect() as conn:
+        rows = qp.list_proofs(
+            conn,
+            quarantine_id=quarantine_id,
+            policy_version=policy_version,
+            reason_code=reason_code,
+            quarantine_key=quarantine_key,
+            action=action,
+            limit=limit,
+        )
+        return {"证明": rows, "条数": len(rows)}
+
+
 def update_policy(code: str, policy: str, updated_by: str) -> dict:
+    """改策略 = 追加新版本，只影响变更后新决策；不触碰任何隔离/确认历史行。"""
     with connect() as conn:
         try:
             row = qp.update_policy(conn, code, policy, updated_by, _now())
@@ -250,7 +318,8 @@ def confirm_quarantine(quarantine_id: int, confirmed_by: str, note: str = "") ->
             raise HTTPException(404, "隔离项不存在")
         if item["status"] != "未平":
             raise HTTPException(409, f"该隔离项已处理（{item['status']}），无需确认")
-        policy = _current_policy(qp.policy_map(conn), item["reason_code"])
+        row = _policy_row(qp.policy_map(conn), item["reason_code"])
+        policy = row["policy"]
         if policy != qp.POLICY_CONFIRM:
             raise HTTPException(
                 409, f"该原因码当前策略为「{policy}」，不接受确认标记"
@@ -262,13 +331,32 @@ def confirm_quarantine(quarantine_id: int, confirmed_by: str, note: str = "") ->
         conn.execute(
             """
             INSERT INTO quarantine_confirmations(
-              quarantine_id, policy_at_confirm, note, confirmed_by, created_at
-            ) VALUES (?, ?, ?, ?, ?)
+              quarantine_id, policy_at_confirm, policy_version, note, confirmed_by, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (quarantine_id, policy, note or "", confirmed_by or "未署名", now),
+            (
+                quarantine_id,
+                policy,
+                row["version"],
+                note or "",
+                confirmed_by or "未署名",
+                now,
+            ),
+        )
+        qp.append_proof(
+            conn,
+            quarantine_id=quarantine_id,
+            quarantine_key=item["entry_key"],
+            reason_code=item["reason_code"],
+            policy_version=row["version"],
+            policy=policy,
+            action=qp.ACTION_CONFIRM,
+            settle_run_id=None,
+            now=now,
+            detail=f"确认人 {confirmed_by or '未署名'}",
         )
         conn.commit()
-        row = conn.execute(
+        row_out = conn.execute(
             """
             SELECT c.*, q.reason_code, q.reason, q.amount_cents, q.status
             FROM quarantine_confirmations c
@@ -277,7 +365,7 @@ def confirm_quarantine(quarantine_id: int, confirmed_by: str, note: str = "") ->
             """,
             (quarantine_id,),
         ).fetchone()
-        return dict(row)
+        return dict(row_out)
 
 
 # —— 归并 ——
@@ -293,26 +381,45 @@ def _insert_quarantine(
     run_id: int,
     now: str,
     policy_map: dict[str, dict],
-) -> None:
-    conn.execute(
+) -> int:
+    """落一条隔离，并钉死当轮策略快照 + 追加「隔离」证明。"""
+    row = _policy_row(policy_map, code)
+    cur = conn.execute(
         """
         INSERT INTO quarantine_items(
           entry_key, account_id, reason_code, reason, policy_at_quarantine,
-          amount_cents, status, retry_count, settle_run_id, last_checked_run_id, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, '未平', 0, ?, ?, ?)
+          policy_version, amount_cents, status, retry_count, settle_run_id,
+          last_checked_run_id, last_checked_policy_version, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, '未平', 0, ?, ?, ?, ?)
         """,
         (
             entry_key,
             account_id,
             code,
             qp.reason_text(code),
-            _current_policy(policy_map, code),
+            row["policy"],
+            row["version"],
             amount_cents,
             run_id,
             run_id,
+            row["version"],
             now,
         ),
     )
+    qid = cur.lastrowid
+    qp.append_proof(
+        conn,
+        quarantine_id=qid,
+        quarantine_key=entry_key,
+        reason_code=code,
+        policy_version=row["version"],
+        policy=row["policy"],
+        action=qp.ACTION_QUARANTINE,
+        settle_run_id=run_id,
+        now=now,
+        detail=f"入隔离，金额 {amount_cents} 分",
+    )
+    return qid
 
 
 def _judge(
@@ -354,8 +461,11 @@ def _record_failed_run(conn, error: str, now: str) -> None:
 def run_settle() -> dict:
     """一轮归并：已归并冲正额度 → 隔离项按原因码策略门禁 → 配平并落余额。
 
-    策略门禁与配平同处一个事务：任一失败整体回滚，余额、隔离、运行记录
+    策略门禁与配平同处一个事务：任一失败整体回滚，余额、隔离、证明、运行记录
     都不会出现「策略已执行但余额未配」的半截状态。
+
+    决策路径：每轮复扫都按**当前**策略版本作新决策，旧隔离行只在仍是「未平」
+    时更新本轮检查信息；一旦「已再配」，其处置字段被触发器钉死，永不再改。
     """
     conn = connect()
     now = _now()
@@ -424,15 +534,36 @@ def run_settle() -> dict:
             item = quarantine_by_entry.get(r["entry_key"])
             rechecking = item is not None
             if rechecking:
-                policy, allowed = _gate(conn, policy_map, item)
+                policy_row, allowed = _gate(conn, policy_map, item)
                 if not allowed:
-                    if policy == qp.POLICY_PERMANENT:
+                    if policy_row["policy"] == qp.POLICY_PERMANENT:
                         blocked_permanent += 1
+                        action = qp.ACTION_BLOCK_PERMANENT
                     else:
                         blocked_confirm += 1
+                        action = qp.ACTION_BLOCK_CONFIRM
+                    # 禁门：只更新「本轮检查过」的元数据，处置字段（status /
+                    # policy_at_quarantine / resolved_*）一律不动。
                     conn.execute(
-                        "UPDATE quarantine_items SET last_checked_run_id = ? WHERE id = ?",
-                        (run_id, item["id"]),
+                        """
+                        UPDATE quarantine_items
+                        SET last_checked_run_id = ?, last_checked_policy_version = ?,
+                            retry_count = retry_count + 1
+                        WHERE id = ?
+                        """,
+                        (run_id, policy_row["version"], item["id"]),
+                    )
+                    qp.append_proof(
+                        conn,
+                        quarantine_id=item["id"],
+                        quarantine_key=item["entry_key"],
+                        reason_code=item["reason_code"],
+                        policy_version=policy_row["version"],
+                        policy=policy_row["policy"],
+                        action=action,
+                        settle_run_id=run_id,
+                        now=now,
+                        detail=f"策略「{policy_row['policy']}」拦下，未触达余额",
                     )
                     continue
                 if r["status"] != "已隔离":
@@ -462,35 +593,89 @@ def run_settle() -> dict:
                 )
                 settled += 1
                 if rechecking:
+                    policy_row = _policy_row(policy_map, item["reason_code"])
                     conn.execute(
                         """
                         UPDATE quarantine_items
                         SET status = '已再配', resolved_run_id = ?, resolved_at = ?,
-                            last_checked_run_id = ?, policy_at_quarantine = ?
-                        WHERE id = ?
+                            last_checked_run_id = ?, last_checked_policy_version = ?
+                        WHERE id = ? AND status = '未平'
                         """,
                         (
                             run_id,
                             now,
                             run_id,
-                            _current_policy(policy_map, item["reason_code"]),
+                            policy_row["version"],
                             item["id"],
                         ),
+                    )
+                    qp.append_proof(
+                        conn,
+                        quarantine_id=item["id"],
+                        quarantine_key=item["entry_key"],
+                        reason_code=item["reason_code"],
+                        policy_version=policy_row["version"],
+                        policy=policy_row["policy"],
+                        action=qp.ACTION_REBALANCE,
+                        settle_run_id=run_id,
+                        now=now,
+                        detail=f"再配 {r['amount_cents']} 分，入原单账户 #{hit_account}",
                     )
                     settled_from_quarantine += 1
                 continue
 
             # 未能配平
             if rechecking:
-                new_policy = _current_policy(policy_map, code)
-                conn.execute(
-                    """
-                    UPDATE quarantine_items
-                    SET reason_code = ?, reason = ?, policy_at_quarantine = ?,
-                        retry_count = retry_count + 1, last_checked_run_id = ?
-                    WHERE id = ?
-                    """,
-                    (code, qp.reason_text(code), new_policy, run_id, item["id"]),
+                new_row = _policy_row(policy_map, code)
+                changed = code != item["reason_code"]
+                if changed:
+                    # 改判是一次**新决策**：为它钉死新的策略版本，旧决策仍可由
+                    # 只追加的策略证明回溯。策略变更本身不会走到这里。
+                    conn.execute(
+                        """
+                        UPDATE quarantine_items
+                        SET reason_code = ?, reason = ?, policy_at_quarantine = ?,
+                            policy_version = ?, retry_count = retry_count + 1,
+                            last_checked_run_id = ?, last_checked_policy_version = ?
+                        WHERE id = ?
+                        """,
+                        (
+                            code,
+                            qp.reason_text(code),
+                            new_row["policy"],
+                            new_row["version"],
+                            run_id,
+                            new_row["version"],
+                            item["id"],
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE quarantine_items
+                        SET retry_count = retry_count + 1,
+                            last_checked_run_id = ?, last_checked_policy_version = ?
+                        WHERE id = ?
+                        """,
+                        (run_id, new_row["version"], item["id"]),
+                    )
+                qp.append_proof(
+                    conn,
+                    quarantine_id=item["id"],
+                    quarantine_key=item["entry_key"],
+                    reason_code=code,
+                    policy_version=new_row["version"],
+                    policy=new_row["policy"],
+                    action=(
+                        qp.ACTION_RECLASSIFY if changed else qp.ACTION_RECHECK_FAILED
+                    ),
+                    settle_run_id=run_id,
+                    now=now,
+                    detail=(
+                        f"原因码 {item['reason_code']} → {code}"
+                        if changed
+                        else "复扫仍未配平，保持未平"
+                    ),
                 )
             else:
                 _insert_quarantine(

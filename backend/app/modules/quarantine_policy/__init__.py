@@ -1,18 +1,49 @@
-"""隔离原因码策略机。
+"""隔离原因码策略机（只追加版本 + 策略证明）。
 
-落地形态：**原因码策略表**（`quarantine_policies`），每个有限原因码恰好一行、
-一个互斥策略；不采用「配置行不可变快照 + 版本号」形态。策略在设置页可维护，
-归并扫描一律以当前策略表为准。
+落库形态（择一，本仓取第一种）：
+
+1. **策略表按原因码 + 版本**：`quarantine_policies(reason_code, version)` 只追加，
+   一个原因码的「当前策略」= 该码的最大版本；改策略只 INSERT 新版本，绝不 UPDATE。
+2. **策略证明**：`quarantine_policy_proofs` 记录每一次隔离决策
+   （原因码 / 策略版本 / 动作 / 隔离键），只追加、可回溯、只读查询。
+
+决策路径（择一，本仓取第一种）：
+
+- **决策行钉死策略版本，再配只追加新决策不改旧行**。隔离行在入隔离时钉死
+  `policy_at_quarantine + policy_version`，此后任何策略变更都不改写该行；
+  每轮复扫是一次**新决策**，按当前（最新）策略版本执行，并追加一条策略证明。
+  旧决策行与已处置行的处置字段不可变。
+
+因此：策略版本一处变更不会驱动历史隔离处置行改写，只影响变更后新决策。
 """
 from __future__ import annotations
 
 import sqlite3
+import uuid
 
 # 三个互斥策略：一个原因码只能绑定其中一个。
 POLICY_AUTO = "自动可再配"
 POLICY_CONFIRM = "需确认后可再配"
 POLICY_PERMANENT = "永久拒绝"
 ALL_POLICIES = (POLICY_AUTO, POLICY_CONFIRM, POLICY_PERMANENT)
+
+# 策略证明的动作目录（只追加，不改写）。
+ACTION_QUARANTINE = "隔离"
+ACTION_REBALANCE = "再配"
+ACTION_BLOCK_PERMANENT = "永久拒绝拦下"
+ACTION_BLOCK_CONFIRM = "待确认拦下"
+ACTION_RECLASSIFY = "原因码重判"
+ACTION_RECHECK_FAILED = "复扫未通过"
+ACTION_CONFIRM = "确认登记"
+ALL_ACTIONS = (
+    ACTION_QUARANTINE,
+    ACTION_REBALANCE,
+    ACTION_BLOCK_PERMANENT,
+    ACTION_BLOCK_CONFIRM,
+    ACTION_RECLASSIFY,
+    ACTION_RECHECK_FAILED,
+    ACTION_CONFIRM,
+)
 
 # 有限原因码目录。原因码是枚举，不允许运行时新增；策略可在设置页改。
 REASON_CODES = (
@@ -84,14 +115,24 @@ def legacy_code(reason: str) -> str | None:
     return LEGACY_REASON_TO_CODE.get(reason)
 
 
+# —— 策略表（原因码 + 版本，只追加） ——
+
+
 def seed_policies(conn: sqlite3.Connection, now: str) -> None:
-    """补种缺失原因码；不覆盖设置页已维护的策略。"""
+    """补种缺失原因码的**首个版本**；已有版本的码一律不动。"""
     for d in REASON_CODES:
+        exists = conn.execute(
+            "SELECT 1 FROM quarantine_policies WHERE reason_code = ? LIMIT 1",
+            (d["code"],),
+        ).fetchone()
+        if exists:
+            continue
         conn.execute(
             """
-            INSERT OR IGNORE INTO quarantine_policies(
-              reason_code, label, description, policy, sort_order, updated_by, updated_at
-            ) VALUES (?, ?, ?, ?, ?, '系统', ?)
+            INSERT INTO quarantine_policies(
+              reason_code, version, label, description, policy, sort_order,
+              updated_by, updated_at
+            ) VALUES (?, 1, ?, ?, ?, ?, '系统', ?)
             """,
             (
                 d["code"],
@@ -104,19 +145,59 @@ def seed_policies(conn: sqlite3.Connection, now: str) -> None:
         )
 
 
+_CURRENT_SELECT = """
+SELECT p.reason_code, p.version, p.label, p.description, p.policy,
+       p.sort_order, p.updated_by, p.updated_at
+FROM quarantine_policies p
+JOIN (
+  SELECT reason_code, MAX(version) AS version
+  FROM quarantine_policies
+  GROUP BY reason_code
+) m ON m.reason_code = p.reason_code AND m.version = p.version
+"""
+
+
 def list_policies(conn: sqlite3.Connection) -> list[dict]:
+    """每个原因码的当前版本（最大版本）。"""
     rows = conn.execute(
-        """
-        SELECT reason_code, label, description, policy, sort_order, updated_by, updated_at
-        FROM quarantine_policies
-        ORDER BY sort_order, reason_code
-        """
+        _CURRENT_SELECT + " ORDER BY p.sort_order, p.reason_code"
     ).fetchall()
     return [dict(r) for r in rows]
 
 
 def policy_map(conn: sqlite3.Connection) -> dict[str, dict]:
     return {r["reason_code"]: r for r in list_policies(conn)}
+
+
+def list_policy_versions(conn: sqlite3.Connection, code: str | None = None) -> list[dict]:
+    """只读版本台账：全部版本按原因码 + 版本倒序。"""
+    if code:
+        rows = conn.execute(
+            """
+            SELECT * FROM quarantine_policies
+            WHERE reason_code = ?
+            ORDER BY version DESC
+            """,
+            (code,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM quarantine_policies
+            ORDER BY sort_order, reason_code, version DESC
+            """
+        ).fetchall()
+    current = {
+        r["reason_code"]: r["version"] for r in conn.execute(
+            "SELECT reason_code, MAX(version) AS version FROM quarantine_policies GROUP BY reason_code"
+        ).fetchall()
+    }
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["is_current"] = current.get(d["reason_code"]) == d["version"]
+        out.append(d)
+    return out
 
 
 def update_policy(
@@ -126,40 +207,142 @@ def update_policy(
     updated_by: str,
     now: str,
 ) -> dict:
+    """改策略 = 追加一个新版本；不触碰任何隔离行/确认行（禁止回溯改史）。"""
     if not is_valid_policy(policy):
         raise ValueError(f"未知策略：{policy}")
     row = conn.execute(
-        "SELECT * FROM quarantine_policies WHERE reason_code = ?", (code,)
+        """
+        SELECT * FROM quarantine_policies
+        WHERE reason_code = ?
+        ORDER BY version DESC
+        LIMIT 1
+        """,
+        (code,),
     ).fetchone()
     if not row:
         raise LookupError(f"原因码不存在：{code}")
+    if row["policy"] == policy:
+        # 策略未变：不制造空版本，直接返回当前行。
+        out = dict(row)
+        out["appended"] = False
+        return out
+
     conn.execute(
         """
-        UPDATE quarantine_policies
-        SET policy = ?, updated_by = ?, updated_at = ?
-        WHERE reason_code = ?
+        INSERT INTO quarantine_policies(
+          reason_code, version, label, description, policy, sort_order,
+          updated_by, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (policy, updated_by or "未署名", now, code),
-    )
-    conn.execute(
-        """
-        UPDATE quarantine_items
-        SET policy_at_quarantine = ?
-        WHERE reason_code = ?
-        """,
-        (policy, code),
-    )
-    conn.execute(
-        """
-        UPDATE quarantine_confirmations
-        SET policy_at_confirm = ?
-        WHERE quarantine_id IN (
-          SELECT id FROM quarantine_items WHERE reason_code = ?
-        )
-        """,
-        (policy, code),
+        (
+            code,
+            row["version"] + 1,
+            row["label"],
+            row["description"],
+            policy,
+            row["sort_order"],
+            updated_by or "未署名",
+            now,
+        ),
     )
     updated = conn.execute(
-        "SELECT * FROM quarantine_policies WHERE reason_code = ?", (code,)
+        """
+        SELECT * FROM quarantine_policies
+        WHERE reason_code = ?
+        ORDER BY version DESC
+        LIMIT 1
+        """,
+        (code,),
     ).fetchone()
-    return dict(updated)
+    out = dict(updated)
+    out["appended"] = True
+    return out
+
+
+# —— 策略证明（只追加，只读查询） ——
+
+
+def append_proof(
+    conn: sqlite3.Connection,
+    *,
+    quarantine_id: int,
+    quarantine_key: str,
+    reason_code: str,
+    policy_version: int,
+    policy: str,
+    action: str,
+    settle_run_id: int | None,
+    now: str,
+    detail: str = "",
+) -> None:
+    """追加一条策略证明。永远不会 UPDATE/DELETE 既有证明。"""
+    conn.execute(
+        """
+        INSERT INTO quarantine_policy_proofs(
+          proof_key, quarantine_id, quarantine_key, reason_code,
+          policy_version, policy, action, settle_run_id, detail, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"QPP-{uuid.uuid4().hex[:12].upper()}",
+            quarantine_id,
+            quarantine_key,
+            reason_code,
+            policy_version,
+            policy,
+            action,
+            settle_run_id,
+            detail,
+            now,
+        ),
+    )
+
+
+def list_proofs(
+    conn: sqlite3.Connection,
+    *,
+    quarantine_id: int | None = None,
+    policy_version: int | None = None,
+    reason_code: str | None = None,
+    quarantine_key: str | None = None,
+    action: str | None = None,
+    limit: int = 200,
+) -> list[dict]:
+    """只读：按隔离 id / 策略版本 / 原因码 / 隔离键 / 动作查询策略证明。"""
+    clauses: list[str] = []
+    params: list[object] = []
+    if quarantine_id is not None:
+        clauses.append("quarantine_id = ?")
+        params.append(quarantine_id)
+    if policy_version is not None:
+        clauses.append("policy_version = ?")
+        params.append(policy_version)
+    if reason_code:
+        clauses.append("reason_code = ?")
+        params.append(reason_code)
+    if quarantine_key:
+        clauses.append("quarantine_key = ?")
+        params.append(quarantine_key)
+    if action:
+        clauses.append("action = ?")
+        params.append(action)
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+    limit = max(1, min(int(limit), 1000))
+    params.append(limit)
+    rows = conn.execute(
+        f"""
+        SELECT * FROM quarantine_policy_proofs
+        {where}
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        tuple(params),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_proof(conn: sqlite3.Connection, proof_id: int) -> dict | None:
+    row = conn.execute(
+        "SELECT * FROM quarantine_policy_proofs WHERE id = ?", (proof_id,)
+    ).fetchone()
+    return dict(row) if row else None
